@@ -1,6 +1,7 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
@@ -12,22 +13,26 @@ CONFIG = {
 }
 
 
-def post_json(url, headers, payload):
+def post_json(url, headers, payload, max_retries=3):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        # raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-        error_body = exc.read().decode("utf-8", errors="replace")
-
-        raise RuntimeError(
-            f"Provider trả HTTP {exc.code}; "
-            f"response_body={error_body[:2000]}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    for attempt in range(max_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            # Tự động retry khi gặp Rate Limit (429) hoặc Service Unavailable (503)
+            if exc.code in (429, 503) and attempt < max_retries:
+                retry_after = exc.headers.get('Retry-After')
+                try:
+                    delay = float(retry_after) if retry_after else (2 ** attempt * 2 + 1)
+                except Exception:
+                    delay = 2 ** attempt * 2 + 1
+                time.sleep(delay)
+                continue
+            # Do not print response bodies: they may contain account or request data.
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
 
 
 class Provider:
@@ -50,7 +55,7 @@ class Provider:
     def complete(self, messages, schemas):
         if self.name == 'anthropic':
             return self._anthropic(messages, schemas)
-        payload = {'model': self.model, 'messages': messages}
+        payload = {'model': self.model, 'messages': messages, 'max_tokens': int(os.getenv('MAX_TOKENS', '2048'))}
         if schemas:
             payload['tools'] = schemas
         data = post_json(self.url, {'Authorization': f'Bearer {self.key}'}, payload)
